@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/corroborate",
+      "destination": "/api/index.py"
+    }
+  ]
+}
