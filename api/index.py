@@ -1,7 +1,8 @@
 from datetime import datetime, timezone
+from math import isfinite
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 
@@ -17,25 +18,27 @@ VALID_TYPES = {
 }
 
 
-def parse_timestamp(value: Any):
-    """
-    Parse an ISO-8601 timestamp.
+def invalid_result():
+    return {
+        "verdict": "invalid",
+        "confidence": "low",
+        "corroboratingSources": [],
+    }
 
-    Returns a timezone-aware datetime or None.
-    """
+
+def parse_timestamp(value: Any):
     if not isinstance(value, str):
         return None
 
     try:
         text = value.strip()
 
-        # Support timestamps ending in Z.
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
 
         dt = datetime.fromisoformat(text)
 
-        # Treat a timestamp without timezone information as invalid.
+        # A timestamp without timezone is not accepted.
         if dt.tzinfo is None:
             return None
 
@@ -45,12 +48,7 @@ def parse_timestamp(value: Any):
         return None
 
 
-def is_valid_source(source: Any) -> bool:
-    """
-    A source is valid only when:
-      id, origin, value, observedAt are strings
-      type is one of the five allowed values.
-    """
+def valid_source(source: Any) -> bool:
     if not isinstance(source, dict):
         return False
 
@@ -72,18 +70,10 @@ def is_valid_source(source: Any) -> bool:
     return True
 
 
-def is_fresh(source: dict, as_of: datetime, staleness_days: float) -> bool:
-    """
-    Fresh means:
-
-        asOf - observedAt <= stalenessDays
-
-    A future observedAt is not stale, because the difference is negative.
-    """
-    observed_at = parse_timestamp(source["observedAt"])
+def fresh(source: dict, as_of: datetime, staleness_days: float) -> bool:
+    observed_at = parse_timestamp(source.get("observedAt"))
 
     if observed_at is None:
-        # Invalid timestamp means the source cannot participate.
         return False
 
     age_seconds = (as_of - observed_at).total_seconds()
@@ -92,154 +82,134 @@ def is_fresh(source: dict, as_of: datetime, staleness_days: float) -> bool:
     return age_seconds <= allowed_seconds
 
 
-def invalid_response():
-    return {
-        "verdict": "invalid",
-        "confidence": "low",
-        "corroboratingSources": [],
-    }
-
-
-def corroborate(body: Any) -> dict:
-    # ------------------------------------------------------------
-    # Rule 1: invalid input
-    # ------------------------------------------------------------
+def process(body: Any):
+    # ============================================================
+    # RULE 1 — INVALID
+    # ============================================================
 
     if not isinstance(body, dict):
-        return invalid_response()
+        return invalid_result()
 
     claim = body.get("claim")
 
     if not isinstance(claim, dict):
-        return invalid_response()
+        return invalid_result()
 
     claim_value = claim.get("value")
 
     if not isinstance(claim_value, str):
-        return invalid_response()
+        return invalid_result()
 
-    as_of_raw = body.get("asOf")
+    if "asOf" not in body:
+        return invalid_result()
 
-    if as_of_raw is None:
-        return invalid_response()
-
-    as_of = parse_timestamp(as_of_raw)
+    as_of = parse_timestamp(body.get("asOf"))
 
     if as_of is None:
-        return invalid_response()
+        return invalid_result()
 
     staleness_days = body.get("stalenessDays")
 
-    # bool is technically a subclass of int in Python, but must
-    # not be accepted as a number here.
+    # bool is not accepted as a number.
     if isinstance(staleness_days, bool):
-        return invalid_response()
+        return invalid_result()
 
     if not isinstance(staleness_days, (int, float)):
-        return invalid_response()
+        return invalid_result()
 
-    # NaN / infinity are not meaningful staleness windows.
-    if not __import__("math").isfinite(float(staleness_days)):
-        return invalid_response()
+    if not isfinite(float(staleness_days)):
+        return invalid_result()
 
     sources = body.get("sources")
 
     if not isinstance(sources, list):
-        return invalid_response()
+        return invalid_result()
 
-    # ------------------------------------------------------------
-    # Keep only structurally valid sources.
-    # Invalid sources are ignored entirely.
-    # ------------------------------------------------------------
+    # ============================================================
+    # VALID SOURCES ONLY
+    # ============================================================
 
     valid_sources = [
         source
         for source in sources
-        if is_valid_source(source)
+        if valid_source(source)
     ]
 
-    # ------------------------------------------------------------
-    # Rule 2: authoritative fresh contradiction
+    # ============================================================
+    # RULE 2 — CONTRADICTED
     #
-    # This check happens BEFORE support.
-    # ------------------------------------------------------------
+    # Fresh authoritative disagreement has priority over support.
+    # ============================================================
 
-    contradicting = []
+    contradictions = []
 
     for source in valid_sources:
-        if not source.get("authoritative", False):
+        if source.get("authoritative") is not True:
             continue
 
-        if not is_fresh(source, as_of, float(staleness_days)):
+        if not fresh(
+            source,
+            as_of,
+            float(staleness_days),
+        ):
             continue
 
         if source["value"] != claim_value:
-            contradicting.append(source["id"])
+            contradictions.append(source["id"])
 
-    if contradicting:
+    if contradictions:
         return {
             "verdict": "contradicted",
             "confidence": "low",
-            "corroboratingSources": sorted(contradicting),
+            "corroboratingSources": sorted(contradictions),
         }
 
-    # ------------------------------------------------------------
-    # Rule 3:
+    # ============================================================
+    # RULE 3 — SUPPORTED
     #
-    # Keep only:
-    #   - fresh
-    #   - agreeing with claim
-    #
-    # Then one representative per origin.
-    # Representative = lexicographically smallest id.
-    # ------------------------------------------------------------
+    # Only fresh sources agreeing with the claim.
+    # One representative per origin.
+    # Representative = lexicographically smallest ID.
+    # ============================================================
 
-    agreeing_fresh = []
+    representatives = {}
 
     for source in valid_sources:
-        if not is_fresh(source, as_of, float(staleness_days)):
+        if not fresh(
+            source,
+            as_of,
+            float(staleness_days),
+        ):
             continue
 
         if source["value"] != claim_value:
             continue
 
-        agreeing_fresh.append(source)
-
-    representatives_by_origin = {}
-
-    for source in agreeing_fresh:
         origin = source["origin"]
 
-        current = representatives_by_origin.get(origin)
+        existing = representatives.get(origin)
 
-        if current is None or source["id"] < current["id"]:
-            representatives_by_origin[origin] = source
+        if existing is None or source["id"] < existing["id"]:
+            representatives[origin] = source
 
-    representatives = list(representatives_by_origin.values())
+    reps = list(representatives.values())
 
-    if len(representatives) >= 2:
-        representative_ids = sorted(
-            source["id"] for source in representatives
-        )
+    if len(reps) >= 2:
+        ids = sorted(source["id"] for source in reps)
 
-        distinct_types = {
-            source["type"] for source in representatives
-        }
+        types = {source["type"] for source in reps}
 
-        if len(distinct_types) >= 2:
-            confidence = "high"
-        else:
-            confidence = "medium"
+        confidence = "high" if len(types) >= 2 else "medium"
 
         return {
             "verdict": "supported",
             "confidence": confidence,
-            "corroboratingSources": representative_ids,
+            "corroboratingSources": ids,
         }
 
-    # ------------------------------------------------------------
-    # Rule 4: everything else is unverified.
-    # ------------------------------------------------------------
+    # ============================================================
+    # RULE 4 — UNVERIFIED
+    # ============================================================
 
     return {
         "verdict": "unverified",
@@ -249,8 +219,13 @@ def corroborate(body: Any) -> dict:
 
 
 @app.post("/corroborate")
-async def corroborate_endpoint(body: Any):
-    result = corroborate(body)
+async def corroborate(body: Any):
+    return JSONResponse(content=process(body))
 
-    # Explicitly return only the required response object.
-    return JSONResponse(content=result)
+
+# Vercel normally routes api/index.py through /api/*.
+# This second route makes the same application available if
+# Vercel forwards the rewritten path as /api/corroborate.
+@app.post("/api/corroborate")
+async def corroborate_api(body: Any):
+    return JSONResponse(content=process(body))
